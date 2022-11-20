@@ -3,6 +3,7 @@ package card
 import (
 	"crypto/ecdsa"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/binary"
 	"errors"
 
@@ -37,6 +38,7 @@ type Phonon struct {
 	KeyIndex   uint32
 	AssetType  assetType.AssetType
 	CurveType  uint32
+	Brand      [32]byte
 	Value      uint32
 	privateKey ecdsa.PrivateKey
 }
@@ -60,6 +62,7 @@ type PhononTransferPacket struct {
 	SendersCertificate  Certificate
 	Signature           []byte
 	CurveType           uint32
+	BrandPublicKey      [32]byte
 	AssetType           uint32
 	Value               uint32
 	IV                  []byte
@@ -102,7 +105,36 @@ func (c *Card) CreatePhonon(curveType uint32) (index uint32) {
 	return keyIndex
 }
 
-// todo - make more generic so users can set custom values in phonon metadata
+func (c *Card) MakePhononFlexible(phononIndex uint32, issuerPublicKey ecdsa.PublicKey, brand []byte, phononPublicKey ecdsa.PublicKey, value uint32, signature []byte) (err error) {
+	phonon, _, err := c.retreivePhonon(phononIndex)
+	if err != nil {
+		return err
+	}
+
+	if phonon.AssetType == assetType.Flexible {
+		return ErrPhononFlexible
+	}
+
+	if phonon.privateKey.PublicKey != phononPublicKey {
+		return ErrIncorrectPhonon
+	}
+
+	signatureData := createCreateFlexiblePhononSignatureData(brand, c.PublicKey, phononPublicKey, value)
+	if !ecdsa.VerifyASN1(&issuerPublicKey, signatureData, signature) {
+		return ErrInvalidSignature
+	}
+
+	issuerPublicKeyBytes := ethcrypto.FromECDSAPub(&issuerPublicKey)
+	brandData := append(issuerPublicKeyBytes, brand...)
+
+	phonon.AssetType = assetType.Flexible
+	phonon.Brand = sha256.Sum256(brandData)
+	phonon.Value = value
+
+	return nil
+}
+
+// todo - make more generic so users can set custom values in phonon metadata but unable to set restricted properties
 func (c *Card) SetPhononDescription(keyIndex uint32, newAssetType assetType.AssetType, newValue uint32) error {
 	phonon, _, err := c.retreivePhonon(keyIndex)
 	if err != nil {
@@ -137,7 +169,17 @@ func (c *Card) RedeemPhonon(keyIndex uint32, data []byte) (pk ecdsa.PrivateKey, 
 		return pk, signature, err
 	}
 
-	pk = phonon.privateKey
+	if phonon.AssetType == assetType.Flexible {
+		signatureData := createRedeemFlexiblePhononSignatureData(phonon.Brand, &phonon.privateKey, phonon.Value, data)
+		signature, err = ecdsa.SignASN1(rand.Reader, &c.privateKey, signatureData)
+
+		if err != nil {
+			return pk, signature, err
+		}
+	} else {
+		pk = phonon.privateKey
+	}
+
 	c.deletedPhononIndexes = append(c.deletedPhononIndexes, phonon.KeyIndex)
 	c.phonons = otherPhonons
 
@@ -168,7 +210,7 @@ func (c *Card) SendPhonon(keyIndex uint32, recipientsPublicKey ecdsa.PublicKey, 
 		return packet, err
 	}
 
-	signatureData := createSendPhononSignatureData(isPosted, recipientsPublicKey, nonce, phonon.privateKey.PublicKey, phononEncryptedPrivateKey)
+	signatureData := createSendPhononSignatureData(isPosted, recipientsPublicKey, nonce, phonon.privateKey.PublicKey, phononEncryptedPrivateKey, phonon.AssetType, phonon.Value, phonon.Brand)
 	signature, err := ecdsa.SignASN1(rand.Reader, &c.privateKey, signatureData)
 	if err != nil {
 		return packet, err
@@ -185,6 +227,7 @@ func (c *Card) SendPhonon(keyIndex uint32, recipientsPublicKey ecdsa.PublicKey, 
 		CurveType:           phonon.CurveType,
 		AssetType:           phonon.AssetType,
 		Value:               phonon.Value,
+		BrandPublicKey:      phonon.Brand,
 		IV:                  iv,
 	}
 
@@ -233,6 +276,7 @@ func (c *Card) ReceivePhonon(packet PhononTransferPacket) (keyIndex uint32, err 
 		CurveType:  packet.CurveType,
 		privateKey: *phononPrivateKey,
 		Value:      packet.Value,
+		Brand:      packet.BrandPublicKey,
 	}
 
 	c.phonons = append(c.phonons, phonon)
@@ -249,6 +293,40 @@ func (c *Card) ReceivePhonon(packet PhononTransferPacket) (keyIndex uint32, err 
 func (c *Card) GetPhonon(keyIndex uint32) (*Phonon, error) {
 	phonon, _, err := c.retreivePhonon(keyIndex)
 	return phonon, err
+}
+
+func (c *Card) MergeFlexiblePhonons(keyIndex1 uint32, keyIndex2 uint32) error {
+	if keyIndex1 == keyIndex2 {
+		return ErrInvalidInput
+	}
+
+	phonon1, _, err := c.retreivePhonon(keyIndex1)
+	if err != nil {
+		return err
+	}
+
+	phonon2, remainingPhonons, err := c.retreivePhonon(keyIndex2)
+	if err != nil {
+		return err
+	}
+
+	if phonon1.AssetType != assetType.Flexible || phonon2.AssetType != assetType.Flexible {
+		return ErrPhononNotFlexible
+	}
+
+	if phonon1.Brand != phonon2.Brand {
+		return ErrDifferentBrands
+	}
+
+	phonon1.Value = phonon1.Value + phonon2.Value
+
+	c.deletedPhononIndexes = append(c.deletedPhononIndexes, phonon2.KeyIndex)
+	c.phonons = remainingPhonons
+	if err != nil {
+		return err
+	}
+
+	return nil
 }
 
 func (c *Card) retreivePhonon(keyIndex uint32) (phonon *Phonon, otherPhonons []*Phonon, err error) {
@@ -279,12 +357,18 @@ func (c *Card) nextPhononKeyIndex() (keyIndex uint32) {
 	return keyIndex
 }
 
-func createSendPhononSignatureData(isPosted bool, recipientsPublicKey ecdsa.PublicKey, nonce uint32, phononPublicKey ecdsa.PublicKey, phononEncryptedPrivateKey []byte) []byte {
+func createSendPhononSignatureData(isPosted bool, recipientsPublicKey ecdsa.PublicKey, nonce uint32, phononPublicKey ecdsa.PublicKey, phononEncryptedPrivateKey []byte, at assetType.AssetType, value uint32, brand [32]byte) []byte {
 	phononPublicKeyBytes := ethcrypto.FromECDSAPub(&phononPublicKey)
 	recipientsPublicKeyBytes := ethcrypto.FromECDSAPub(&recipientsPublicKey)
 
 	nonceBytes := make([]byte, 4)
 	binary.LittleEndian.PutUint32(nonceBytes, nonce)
+
+	assetTypeBytes := make([]byte, 4)
+	binary.LittleEndian.PutUint32(assetTypeBytes, at)
+
+	valueBytes := make([]byte, 4)
+	binary.LittleEndian.PutUint32(valueBytes, value)
 
 	isPostedBytes := make([]byte, 1)
 	if isPosted {
@@ -297,12 +381,43 @@ func createSendPhononSignatureData(isPosted bool, recipientsPublicKey ecdsa.Publ
 	sigData = append(sigData, nonceBytes...)
 	sigData = append(sigData, phononPublicKeyBytes...)
 	sigData = append(sigData, phononEncryptedPrivateKey...)
+	sigData = append(sigData, phononEncryptedPrivateKey...)
+	sigData = append(sigData, assetTypeBytes...)
+	sigData = append(sigData, valueBytes...)
+	sigData = append(sigData, brand[:]...)
+
+	return sigData
+}
+
+func createCreateFlexiblePhononSignatureData(brand []byte, recipientsPublicKey ecdsa.PublicKey, phononPublicKey ecdsa.PublicKey, value uint32) []byte {
+	recipientsPublicKeyBytes := ethcrypto.FromECDSAPub(&recipientsPublicKey)
+	phononPublicKeyBytes := ethcrypto.FromECDSAPub(&phononPublicKey)
+
+	valueBytes := make([]byte, 4)
+	binary.LittleEndian.PutUint32(valueBytes, value)
+
+	sigData := append(recipientsPublicKeyBytes, phononPublicKeyBytes...)
+	sigData = append(sigData, brand...)
+	sigData = append(sigData, valueBytes...)
+
+	return sigData
+}
+
+func createRedeemFlexiblePhononSignatureData(brand [32]byte, phononPrivateKey *ecdsa.PrivateKey, value uint32, data []byte) []byte {
+	phononPrivateKeyBytes := ethcrypto.FromECDSA(phononPrivateKey)
+
+	valueBytes := make([]byte, 4)
+	binary.LittleEndian.PutUint32(valueBytes, value)
+
+	sigData := append(brand[:], phononPrivateKeyBytes...)
+	sigData = append(sigData, valueBytes...)
+	sigData = append(sigData, data...)
 
 	return sigData
 }
 
 func transferPacketContentsIsValid(packet PhononTransferPacket) bool {
-	signatureData := createSendPhononSignatureData(packet.IsPosted, packet.RecipientsPublicKey, packet.Nonce, packet.PhononPublicKey, packet.EncryptedPrivateKey)
+	signatureData := createSendPhononSignatureData(packet.IsPosted, packet.RecipientsPublicKey, packet.Nonce, packet.PhononPublicKey, packet.EncryptedPrivateKey, packet.AssetType, packet.Value, packet.BrandPublicKey)
 	return ecdsa.VerifyASN1(&packet.SendersCertificate.CardPublicKey, signatureData, packet.Signature)
 }
 
